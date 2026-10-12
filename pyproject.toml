@@ -1,0 +1,41 @@
+[project]
+name = "saby-mcp-ro"
+version = "0.1.0"
+description = "MCP-сервер только для чтения по API Saby (СБИС): документы, этапы, задачи, контрагенты, сотрудники, сертификаты, МЧД"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "sabyAgent" }]
+keywords = ["mcp", "model-context-protocol", "sbis", "saby", "сбис", "эдо", "readonly", "read-only"]
+
+# Только mcp и httpx. Больше в дереве зависимостей нет намеренно: сервер
+# настолько прост, что лишняя транзитивная библиотека — это лишний риск
+# обновления и лишний код, который придётся читать при аудите.
+dependencies = [
+    # 2.x: FastMCP переименован в MCPServer, остальное API совпадает.
+    "mcp>=2.0,<3",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+saby-mcp = "saby_mcp_ro.server:main"
+
+[project.urls]
+Repository = "https://github.com/example/saby-mcp-ro"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Данных, которые надо возить рядом с кодом, нет: каталог команд, справочник
+# типов и поиск — обычные модули пакета, а не файлы ресурсов.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

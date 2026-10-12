@@ -69,7 +69,7 @@ async def test_root_object_not_overwritten(recorder, client):
 
 async def test_command_without_root_stays_empty(recorder, client):
     """СБИС.СписокАккаунтов принимает пустые params — проверено живьём."""
-    recorder.result({"Список": [{"НазваниеАккаунта": "Миг, ООО"}]})
+    recorder.result({"Список": [{"НазваниеАккаунта": "ООО Ромашка"}]})
     await pagination.fetch_all(client, "spisok_akkauntov")
     assert _bodies(recorder)[0] == {}
 

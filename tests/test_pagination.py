@@ -61,10 +61,26 @@ async def test_root_object_is_injected(recorder, client):
 
 
 async def test_root_object_not_overwritten(recorder, client):
+    """Фильтр вызывающего не теряется, хотя страница в него добавляется.
+
+    Раньше проверка была строгой (`== {"Тип": "Счет"}`), но с появлением
+    `Навигация.РазмерСтраницы` в фильтр добавляется ещё и размер страницы —
+    суть проверки не в этом, а в том, что ключи вызывающего целы.
+    """
     recorder.result(_page(_rows(5)))
     await pagination.fetch_all(client, "spisok_dokumentov",
                                {"Фильтр": {"Тип": "Счет"}})
-    assert _bodies(recorder)[0]["Фильтр"] == {"Тип": "Счет"}
+    sent = _bodies(recorder)[0]["Фильтр"]
+    assert sent["Тип"] == "Счет"
+    assert sent["Навигация"] == {"РазмерСтраницы": pagination.PAGE_SIZE}
+
+
+async def test_page_size_is_capped_at_saby_limit(recorder, client):
+    """Saby молча срезает всё, что выше 200, — лучше не просить заведомо."""
+    recorder.result(_page(_rows(5)))
+    await pagination.fetch_all(client, "spisok_dokumentov", {}, page_size=5000)
+    sent = _bodies(recorder)[0]["Фильтр"]["Навигация"]
+    assert sent == {"РазмерСтраницы": "200"}
 
 
 async def test_command_without_root_stays_empty(recorder, client):

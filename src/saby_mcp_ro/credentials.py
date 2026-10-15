@@ -4,17 +4,16 @@
 действует. Поэтому она лежит в файле с правами 600 вне репозитория, как и
 делает уважающий себя инструмент.
 
-Запись атомарная (mkstemp + os.replace), иначе падение посреди записи
-оставило бы файл, который не читается, и человек потерял бы сессию молча.
+Запись атомарная (mkstemp + os.replace) — из JsonStore, вместе с курсором
+сводки (`digest_state.py`). Второй писатель в тот же файл означал бы второе
+место, где «просто запишем», а падение посреди записи там стоило бы сессии.
 """
 from __future__ import annotations
 
-import contextlib
-import json
 import os
-import stat
-import tempfile
 from pathlib import Path
+
+from .jsonstore import JsonStore
 
 FILENAME = "session.json"
 
@@ -30,50 +29,16 @@ def store_dir() -> Path:
     return Path.home() / ".saby-mcp"
 
 
-class CredentialStore:
-    """Чтение и запись файла сессии."""
+class CredentialStore(JsonStore):
+    """Чтение и запись файла сессии.
+
+    Файл общий с остальными настройками (`SABY_MCP_HOME` перекрывает каталог
+    целиком), а атомарная запись и права 600 — из JsonStore: секрет не должен
+    переживать падение записи вслед за обычным файлом настроек.
+    """
 
     def __init__(self, path: Path | None = None):
-        self.path = path or (store_dir() / FILENAME)
-
-    # -- служебное -----------------------------------------------------------
-
-    def _ensure_dir(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            os.chmod(self.path.parent, stat.S_IRWXU)
-
-    def _read(self) -> dict:
-        if not self.path.exists():
-            return {}
-        try:
-            raw = self.path.read_text(encoding="utf-8")
-        except OSError:
-            return {}
-        if not raw.strip():
-            return {}
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-        return data if isinstance(data, dict) else {}
-
-    def _write(self, data: dict) -> None:
-        self._ensure_dir()
-        fd, tmp = tempfile.mkstemp(dir=str(self.path.parent),
-                                   prefix=self.path.name + ".", suffix=".tmp")
-        try:
-            with contextlib.suppress(OSError):
-                os.chmod(tmp, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(data, ensure_ascii=False, indent=2))
-            os.replace(tmp, self.path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
-            raise
-        with contextlib.suppress(OSError):
-            os.chmod(self.path, 0o600)
+        super().__init__(path or (store_dir() / FILENAME))
 
     # -- публичное -----------------------------------------------------------
 
@@ -84,32 +49,32 @@ class CredentialStore:
         команда `saby-mcp login`, тогда как переменную человек задал,
         возможно, вчера.
         """
-        session = self._read().get("session_id")
+        session = self.read().get("session_id")
         if isinstance(session, str) and session.strip():
             return session.strip()
         env = os.environ.get("SBIS_SESSION_ID", "").strip()
         return env or None
 
     def save_session(self, session_id: str, login: str | None = None) -> None:
-        data = self._read()
+        data = self.read()
         data["session_id"] = session_id.strip()
         if login:
             # Логин не секрет, и по нему видно, чья это сессия.
             data["login"] = login
-        self._write(data)
+        self.write(data)
 
     def clear_session(self) -> bool:
         """Забыть сессию. True, если была."""
-        data = self._read()
+        data = self.read()
         had = bool(data.get("session_id"))
         if had:
             data.pop("session_id", None)
-            self._write(data)
+            self.write(data)
         return had
 
     def describe(self) -> dict:
         """Где лежит файл и есть ли сессия. Без самого секрета."""
-        data = self._read()
+        data = self.read()
         return {
             "path": str(self.path),
             "exists": self.path.exists(),

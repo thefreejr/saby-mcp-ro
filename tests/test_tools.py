@@ -61,7 +61,7 @@ async def mcp_no_session(tmp_path):
 # -- состав ------------------------------------------------------------------
 
 async def test_server_exposes_few_tools(mcp):
-    """Пять инструментов вместо восемнадцати.
+    """Девять инструментов вместо восемнадцати.
 
     У изученного сервера их было 18, из них три давали агенту прямой доступ
     к произвольному пути на домене API. Для сервера только на чтение такой
@@ -71,6 +71,7 @@ async def test_server_exposes_few_tools(mcp):
     assert names == {
         "saby_search", "saby_describe", "saby_call",
         "saby_fetch_all", "saby_whoami", "saby_doc_types", "saby_catalog",
+        "saby_digest", "saby_digest_cursor",
     }
 
 

@@ -677,7 +677,13 @@ async def stages(client: SabyClient, budget: _Budget) -> dict[str, Any]:
 
     items: list[dict[str, Any]] = []
     if pending_count > 0 and budget.take():
-        listing = await client.call_command("spisok_sluzhebnyh_etapov", {})
+        # «Блокировать: Нет» — обязателен именно для чтения. По умолчанию
+        # Saby блокирует список служебных этапов на минуту для всех остальных
+        # пользователей кабинета, привязываясь к сессии вызывающего (справка
+        # stage_doc, комментарий 1). Сводка только смотрит и никто ничего не
+        # обрабатывает — значит, блокировать коллег незачем.
+        listing = await client.call_command("spisok_sluzhebnyh_etapov",
+                                            {"Фильтр": {"Блокировать": "Нет"}})
         items = [compact_doc(r) for r in pagination.extract_rows(listing, "Документ")]
     return {"необработанных": pending_count, "этапы": items}
 

@@ -56,7 +56,9 @@ async def test_every_paginated_command_gets_a_page_size(recorder, client, comman
     assert cmd is not None
     await pagination.fetch_all(client, command_id, {})
     nav = recorder.last["json"]["params"][cmd.params_root]["Навигация"]
-    assert nav["РазмерСтраницы"] == pagination.PAGE_SIZE, command_id
+    # Потолок страницы у каждой команды свой: 200 у реестра, 50 у задач и у
+    # СписокИзменений, 20 у служебных этапов (справка).
+    assert nav["РазмерСтраницы"] == str(cmd.page_size_max), command_id
 
 
 # --- подстановка корневого объекта ------------------------------------------
@@ -83,12 +85,29 @@ async def test_root_object_not_overwritten(recorder, client):
     assert sent["Навигация"]["РазмерСтраницы"] == pagination.PAGE_SIZE
 
 
-async def test_page_size_is_capped_at_saby_limit(recorder, client):
-    """Saby молча срезает всё, что выше 200, — лучше не просить заведомо."""
+async def test_page_size_is_capped_at_command_limit(recorder, client):
+    """У реестра потолок 200 — и просить больше бессмысленно."""
     recorder.result(_page(_rows(5)))
     await pagination.fetch_all(client, "spisok_dokumentov", {}, page_size=5000)
     sent = _bodies(recorder)[0]["Фильтр"]["Навигация"]
     assert sent["РазмерСтраницы"] == "200"
+
+
+@pytest.mark.parametrize("command_id,limit", [
+    ("spisok_zadach", "50"),
+    ("spisok_sluzhebnyh_etapov", "20"),
+    ("spisok_izmeneniy", "50"),
+])
+async def test_each_command_has_its_own_page_limit(recorder, client, command_id, limit):
+    """Справка даёт разные потолки, и общий «200» тут неправ.
+
+    200 у реестра, 50 у задач и у СписокИзменений, 20 у служебных этапов.
+    """
+    recorder.result(_page(_rows(5), Навигация={"ЕстьЕще": "Нет"}))
+    cmd = catalog.get(command_id)
+    await pagination.fetch_all(client, command_id, {})
+    got = _bodies(recorder)[0][cmd.params_root]["Навигация"]["РазмерСтраницы"]
+    assert got == limit, command_id
 
 
 async def test_command_without_root_stays_empty(recorder, client):
@@ -227,8 +246,11 @@ async def test_unchanging_cursor_stops_the_walk(recorder, client):
     assert out["notes"]
 
 
-async def test_command_without_pagination_says_it_is_a_single_page(recorder, client):
-    """У `СписокЗадач` поля Страница нет — обход обрывается и говорит об этом."""
+async def test_missing_position_stops_the_walk_and_says_why(recorder, client):
+    """У задач курсор — позиция. Если сервер её не отдал, обход обязан сказать.
+
+    Соблазн тут такой: пойти по кругу и вернуть первую страницу дважды. Нельзя.
+    """
     _paged(recorder, [
         _page(_rows(25, 0), Навигация={"ЕстьЕще": "Да", "РазмерСтраницы": "25"}),
     ])
@@ -237,7 +259,7 @@ async def test_command_without_pagination_says_it_is_a_single_page(recorder, cli
     assert out["pages_fetched"] == 1
     assert out["total_fetched"] == 25
     assert out["truncated"] is True
-    assert "Страница" in out["notes"][0]
+    assert out["notes"]
 
 
 async def test_max_items_cuts_and_says_so(recorder, client):
@@ -273,6 +295,87 @@ async def test_walk_is_bounded_by_max_pages(recorder, client):
     assert out["pages_fetched"] == pagination.MAX_PAGES
     assert out["truncated"] is True
     assert any("страницах" in n for n in out["notes"])
+
+
+async def test_tasks_walk_by_position(recorder, client):
+    """`position`: «Позиция.ДатаВремя» из «СледующаяПозиция».
+
+    Поле это сочли нерабочим, потому что проверили его на `СписокИзменений`,
+    у которого позиции нет. У задач оно как раз и есть (справка task_list).
+    """
+    _paged(recorder, [
+        _page(_rows(3, 0), Навигация={"ЕстьЕще": "Да",
+                                      "СледующаяПозиция": {"ДатаВремя": "p1"}}),
+        _page(_rows(2, 3), Навигация={"ЕстьЕще": "Нет",
+                                      "СледующаяПозиция": {"ДатаВремя": "p2"}}),
+    ])
+    out = await pagination.fetch_all(client, "spisok_zadach",
+                                     {"Фильтр": {"ТипСписка": "НаМне"}})
+    assert out["total_fetched"] == 5
+    assert out["pages_fetched"] == 2
+    assert out["truncated"] is False
+    first, second = _bodies(recorder)
+    assert "Позиция" not in first["Фильтр"]["Навигация"]
+    assert second["Фильтр"]["Навигация"]["Позиция"] == {"ДатаВремя": "p1"}
+
+
+def _invitation_rows(count, start):
+    return [{"ИдентификаторПриглашения": f"inv-{start + i}",
+             "ДатаВремяСоздания": "16.10.2026 10.00.00"} for i in range(count)]
+
+
+async def test_invitations_have_no_working_cursor(recorder, client):
+    """Справка обещает курсор, сервер его принимает, но выдачу не двигает.
+
+    Проверено на живых данных 16.10.2026: повторный запрос с идентификатором
+    последнего приглашения вернул то же окно. Поэтому команда помечена «none»
+    — и обход честно обрывается, вместо того чтобы крутиться.
+    """
+    _paged(recorder, [
+        _page(_invitation_rows(20, 0), key="СписокПриглашений",
+              Навигация={"ЕстьЕще": "Да"}),
+    ])
+    out = await pagination.fetch_all(client, "spisok_izmeneniy_priglaseniy",
+                                     {"Фильтр": {"ДатаВремяС": "01.01.2026 00.00.00"}})
+    assert out["pages_fetched"] == 1
+    assert out["truncated"] is True
+    assert "Страница" in out["notes"][0]
+
+
+async def test_our_company_is_not_invented_from_data(recorder, client):
+    """Пункт 12 справки велит брать «НашаОрганизацию» из предыдущего запроса.
+
+    Но она не уточнение позиции, а ФИЛЬТР: на живых данных подстановка
+    организации из строк вернула 254 события вместо 260, выкинув вторую
+    организацию. Поэтому в курсор уходит только та, что задал вызывающий.
+    """
+    rows = [{"Идентификатор": "d1",
+             "НашаОрганизация": {"СвЮЛ": {"ИНН": "1655000000"}},
+             "Событие": [{"Идентификатор": "e1", "ДатаВремя": "16.10.2026 10.00.00"}]}]
+    _paged(recorder, [
+        _page(rows, Навигация={"ЕстьЕще": "Да"}),
+        _page(_rows(0), Навигация={"ЕстьЕще": "Нет"}),
+    ])
+    await pagination.fetch_all(client, "spisok_izmeneniy",
+                               {"Фильтр": {"ДатаВремяС": "16.10.2026 00.00.00"}})
+    assert "НашаОрганизация" not in _bodies(recorder)[1]["Фильтр"]
+
+
+async def test_caller_our_company_survives_the_cursor(recorder, client):
+    """А вот заданная вызывающим организация протаскивается в курсор."""
+    rows = [{"Идентификатор": "d1",
+             "НашаОрганизация": {"СвЮЛ": {"ИНН": "1655000000"}},
+             "Событие": [{"Идентификатор": "e1", "ДатаВремя": "16.10.2026 10.00.00"}]}]
+    org = {"СвЮЛ": {"ИНН": "1655000000", "КПП": "165501001"}}
+    _paged(recorder, [
+        _page(rows, Навигация={"ЕстьЕще": "Да"}),
+        _page(_rows(0), Навигация={"ЕстьЕще": "Нет"}),
+    ])
+    await pagination.fetch_all(client, "spisok_izmeneniy",
+                               {"Фильтр": {"ДатаВремяС": "16.10.2026 00.00.00",
+                                           "НашаОрганизация": org}})
+    for body in _bodies(recorder):
+        assert body["Фильтр"]["НашаОрганизация"] == org
 
 
 # --- честность при усечении -------------------------------------------------

@@ -417,57 +417,39 @@ async def test_cursor_advances_only_on_complete_answer():
 
 
 async def test_regression_truncated_changes_do_not_move_the_cursor():
-    """За двое суток изменений больше порции — окно делится пополам до часа."""
-    def page(params):
-        frm = (params.get("Фильтр") or {})["ДатаВремяС"]
-        to = (params.get("Фильтр") or {})["ДатаВремяПо"]
-        span = (datetime.strptime(to, "%d.%m.%Y %H.%M.%S")
-                - datetime.strptime(frm, "%d.%m.%Y %H.%M.%S"))
-        if span <= timedelta(hours=6):
-            # Порция на шесть часов помещается — так и вышло на живых данных.
-            ident = frm[9:10]
-            return {"Документ": [_change(ident=ident, event_id=f"ev-{ident}")],
-                    "Навигация": _nav()}
-        return {"Документ": [_change(ident="a", event_id="ev-a")],
-                "Навигация": _nav("Да")}
+    """Сервер вечно говорит «ЕстьЕще» — курсор сдвигаться не должен.
 
-    client = _Fake(spisok_izmeneniy=page)
+    Обход идёт по «ИдентификаторСобытия». Сервер, отдающий одну и ту же
+    строку, курсор не двигает: обход обязан остановиться, сказать, что выдача
+    неполная, и оставить курсок на месте.
+    """
+    client = _Fake(spisok_izmeneniy={
+        "Документ": [_change()],
+        "Навигация": _nav("Да"),
+    })
     notes: list[str] = []
-    result = await digest.changes(client, datetime(2026, 10, 11),
-                                  datetime(2026, 10, 12, 23, 59, 59),
-                                  digest._Budget(), notes)
-    assert result["полно"] is True
-    assert result["курсор_новый"] == "12.10.2026 23.59.59"
-    # 48 часов делятся пополам, пока порция не перестанет кончаться:
-    # целое число часов не получается (окно делится по минутам), поэтому
-    # уровней чуть больше, чем 48 -> 24 -> 12 -> 6.
-    assert 3 < len(client.seen) <= digest.MAX_CALLS
-    assert notes == []
+    result = await digest.changes(client, datetime(2026, 10, 12), NOW,
+                                   digest._Budget(), notes)
+    assert result["курсор_новый"] is None
+    assert result["полно"] is False
+    assert any("урсор" in note for note in notes)
+    assert len(client.seen) <= 3  # остановился, а не крутился
 
 
 async def test_regression_unsliceable_changes_keep_cursor():
-    """Даже час событий не влез — резать нечем, курсор не двигаем."""
-    client = _Fake(spisok_izmeneniy={"Документ": [_change()], "Навигация": _nav("Да")})
-    notes: list[str] = []
-    result = await digest.changes(client, datetime(2026, 10, 12), NOW,
-                                  digest._Budget(), notes)
-    assert result["курсор_новый"] is None
-    assert result["полно"] is False
-    assert any("порция кончилась" in note for note in notes)
-    assert any("не сдвинут" in note for note in notes)
-
-
-async def test_changes_slicing_stops_at_call_budget():
-    """Бесконечно резать окно нельзя: лимит вызовов — тоже граница."""
-    client = _Fake(spisok_izmeneniy={"Документ": [_change()], "Навигация": _nav("Да")})
+    """Обход упёрся в бюджет и не прошёл — курсор всё равно не двигаем."""
+    client = _Fake(spisok_izmeneniy={
+        "Документ": [_change(ident=str(i), event_id=f"ev-{i}")
+                     for i in range(int(digest.PAGE_SIZE))],
+        "Навигация": _nav("Да"),
+    })
     notes: list[str] = []
     result = await digest.changes(client, datetime(2026, 10, 1), NOW,
-                                  digest._Budget(8), notes)
+                                   digest._Budget(4), notes)
+    assert result["курсор_новый"] is None
     assert result["полно"] is False
-    assert len(client.seen) <= 8
-    assert any("лимит" in note for note in notes)
-
-
+    assert len(client.seen) <= 4
+    assert notes
 async def test_changes_are_sent_with_datetime_boundary():
     client = _Fake(spisok_izmeneniy={"Документ": [], "Навигация": _nav()})
     await digest.changes(client, datetime(2026, 10, 11, 8, 30, 0),

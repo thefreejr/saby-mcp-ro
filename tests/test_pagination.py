@@ -96,7 +96,9 @@ async def test_page_size_is_capped_at_command_limit(recorder, client):
 @pytest.mark.parametrize("command_id,limit", [
     ("spisok_zadach", "50"),
     ("spisok_sluzhebnyh_etapov", "20"),
-    ("spisok_izmeneniy", "50"),
+    # У СписокИзменений справка даёт 0..50, но Saby принимает и 200 (сверено
+    # на живых данных), и на загруженных сутках порция 50 не влезает в бюджет.
+    ("spisok_izmeneniy", "200"),
 ])
 async def test_each_command_has_its_own_page_limit(recorder, client, command_id, limit):
     """Справка даёт разные потолки, и общий «200» тут неправ.

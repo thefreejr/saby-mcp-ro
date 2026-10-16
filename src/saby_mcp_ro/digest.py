@@ -55,6 +55,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from . import config
 from . import pagination
 from .client import SabyClient, SabyError
 
@@ -69,7 +70,11 @@ MAX_DAYS = 31
 # пришлось дробить. Лимит срабатывает на самых загруженных днях и честно
 # попадает в notes.
 MAX_CALLS = 48
-MAX_EVENTS = 400
+MAX_EVENTS = 5000
+# Предел событий в разделе «изменилось». Лимит вызовов ограничивает обход сам
+# (48 вызовов по 200 строк — это до 9600 событий), поэтому отдельно держать
+# маленький потолок незачем: на загруженных сутках 16.10 он срабатывал на
+# 400 событиях и объявлял сводку неполной, потратив всего пять вызовов.
 # Размер страницы, который мы ПРОСИМ у Saby. Без `Навигации` сервер отдаёт
 # первую страницу сам и режет по 25 строк, а `Навигация.РазмерСтраницы`
 # внутри `Фильтр` увеличивает её до 200 — проверено живьём 15.10.2026 на
@@ -81,11 +86,17 @@ MAX_EVENTS = 400
 PAGE_SIZE = "200"
 # Одностраничный фильтр для списочных команд. Указывать нужно ВНУТРИ `Фильтр`:
 # в корне параметров объект игнорируется и ответ приходит пустым.
-def page_filter(extra: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Фильтр списочной команды с явно запрошенной страницей."""
+def page_filter(extra: dict[str, Any] | None = None,
+                accepts_org: bool = True) -> dict[str, Any]:
+    """Фильтр списочной команды: страница плюс отбор по организации.
+
+    Отбор берётся из `config.json` — без него Saby отдаёт смесь по всем
+    организациям кабинета, а у нас их две. Организацию, заданную в `extra`,
+    не перебиваем.
+    """
     merged: dict[str, Any] = dict(extra or {})
     merged["Навигация"] = {"РазмерСтраницы": PAGE_SIZE}
-    return merged
+    return config.scoped_filter({"Фильтр": merged}, accepts_org)
 
 
 # Дробь, до которой окно изменений режется — ТОЛЬКО запасной путь, когда
@@ -297,6 +308,11 @@ class _Budget:
             return False
         self.used += count
         return True
+
+    @property
+    def remaining(self) -> int:
+        """Сколько вызовов ещё можно потратить."""
+        return max(0, self.limit - self.used)
 
 
 async def _incoming_day(
@@ -522,6 +538,43 @@ async def _changes_range(
     client: SabyClient, start: datetime, end: datetime, budget: _Budget,
     notes: list[str],
 ) -> tuple[list[Any], bool]:
+    """Строки `СписокИзменений` за окно — обходом по курсору события.
+
+    Раньше здесь окно делилось пополам рекурсией до 15 минут: считалось, что
+    листать нечем. Утверждение было ложным (см. pagination), и деление стоило
+    ~20 вызовов на сутки.
+
+    Теперь деление заменено курсором — «Фильтр.ИдентификаторСобытия» плюс
+    «ДатаВремяС». Обход общий с `pagination.fetch_all`: заводить рядом второй
+    алгоритм после проверенного незачем.
+
+    Почему деление всё равно было плохо. Дно в 15 минут не спасает: за сутки
+    16.10 накопилось 860 событий, и в часы пик в 15-минутный кусок влезало
+    больше 200. Обход упирался в дно и каждый раз честно, но постоянно,
+    объявляя сводку неполной.
+    """
+    if budget.remaining <= 0:
+        notes.append(
+            f"Изменения с {fmt_dt(start)}: исчерпан лимит вызовов на сводку — "
+            "раздел «что изменилось» собран не полностью."
+        )
+        return [], False
+
+    result = await pagination.fetch_all(
+        client, "spisok_izmeneniy",
+        {"Фильтр": {"ДатаВремяС": fmt_dt(start), "ДатаВремяПо": fmt_dt(end)}},
+        page_size=PAGE_SIZE, max_items=MAX_EVENTS,
+        max_pages=budget.remaining,
+    )
+    budget.take(result["pages_fetched"])
+    notes.extend(result.get("notes") or [])
+    complete = not result["truncated"]
+    if not complete:
+        notes.append(
+            f"Изменения с {fmt_dt(start)}: часть событий не показана. Курсор "
+            "намеренно не сдвинут — в следующий раз они попадут в сводку снова."
+        )
+    return result["items"], complete
     """Строки `СписокИзменений` за окно; делением окна пополам — только как фолбэк.
 
     Эта команда без явной страницы отдаёт 25 строк и `ЕстьЕще = Да`. Раньше
@@ -601,11 +654,6 @@ async def changes(
     исполнитель.
     """
     rows, complete = await _changes_range(client, since_dt, until_dt, budget, notes)
-    if not complete:
-        notes.append(
-            f"Изменения с {fmt_dt(since_dt)}: часть событий не показана. Курсор "
-            "намеренно не сдвинут — в следующий раз они попадут в сводку снова."
-        )
 
     seen: set[str] = set()
     events: list[dict[str, Any]] = []
@@ -682,8 +730,9 @@ async def stages(client: SabyClient, budget: _Budget) -> dict[str, Any]:
         # пользователей кабинета, привязываясь к сессии вызывающего (справка
         # stage_doc, комментарий 1). Сводка только смотрит и никто ничего не
         # обрабатывает — значит, блокировать коллег незачем.
-        listing = await client.call_command("spisok_sluzhebnyh_etapov",
-                                            {"Фильтр": {"Блокировать": "Нет"}})
+        listing = await client.call_command(
+            "spisok_sluzhebnyh_etapov",
+            {"Фильтр": config.scoped_filter({"Блокировать": "Нет"}, True)})
         items = [compact_doc(r) for r in pagination.extract_rows(listing, "Документ")]
     return {"необработанных": pending_count, "этапы": items}
 

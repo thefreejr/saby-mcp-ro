@@ -110,6 +110,7 @@ from __future__ import annotations
 from typing import Any
 
 from . import catalog
+from . import config
 from .client import SabyClient, SabyError
 
 DEFAULT_MAX_ITEMS = 5_000
@@ -228,6 +229,7 @@ async def fetch_all(
     params: dict[str, Any] | None = None,
     page_size: int | None = None,
     max_items: int = DEFAULT_MAX_ITEMS,
+    max_pages: int = MAX_PAGES,
 ) -> dict[str, Any]:
     """Получить все строки команды.
 
@@ -254,6 +256,11 @@ async def fetch_all(
 
     max_items = max(1, max_items)
     base = catalog.with_root(cmd, params)
+    # Если в кабинете несколько организаций, а вызывающий не сказал, какая
+    # его, — подставляем отбор из config.json. Иначе Saby отдаёт смесь по всем
+    # сразу, а с курсором по событию это ещё и риск пропуска. Организацию,
+    # заданную вызывающим, не трогаем.
+    base = config.scope_filter(base, cmd.accepts_our_company)
 
     collected: list[Any] = []
     seen: set[str] = set()
@@ -269,7 +276,11 @@ async def fetch_all(
     if cmd.pagination_mode == "page":
         stuck = {"Навигация": {"Страница": "0"}}
 
-    while pages < MAX_PAGES and len(collected) < max_items:
+    # Почему обход встал, если встал. Пока это None — выдача кончилась
+    # честно, и объявлять усечение незачем.
+    stop: str | None = None
+
+    while pages < max_pages and len(collected) < max_items:
         result = await client.call_command(
             cmd.id, _with_page_size(_merge(base, stuck), page_size,
                                     ceiling=cmd.page_size_max))
@@ -288,18 +299,27 @@ async def fetch_all(
 
         step = _advance(cmd, result, rows)
         if step is None or step == stuck:
+            stop = "stuck"
             break
         stuck = step
+    else:
+        # Цикл дошёл до границы сам, а не вырвался.
+        stop = "max_pages" if pages >= max_pages else "max_items"
 
     if not exhausted:
         truncated = True
-        if pages >= MAX_PAGES:
+        if stop == "stuck":
+            notes.append(_no_way(cmd, nav))
+        elif stop == "max_pages":
             notes.append(
-                f"Обход остановлен на {MAX_PAGES} страницах — выдача больше не "
+                f"Обход остановлен на {max_pages} страницах — выдача больше не "
                 "продвигается. Сузите период."
             )
         else:
-            notes.append(_no_way(cmd, nav))
+            notes.append(
+                f"Достигнут предел в {max_items} строк за один вызов — выдача "
+                "полнее не показана. Уменьшите период или поднимите max_items."
+            )
 
     if len(collected) > max_items:
         collected = collected[:max_items]

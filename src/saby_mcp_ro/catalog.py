@@ -64,6 +64,12 @@ class Command:
     page_size_max: потолок `РазмерСтраницы` ЭТОЙ команды. Он разный и в
         справке тоже разный: 200 у реестра, 50 у задач, 20 у служебных
         этапов. Больше просить бессмысленно — сервер режет сам.
+    accepts_our_company: принимает ли команда отбор «Фильтр.НашаОрганизация».
+        Если в кабинете несколько организаций, такой отбор подставляется
+        из config.json — иначе Saby отдаёт смесь по всем сразу, а с курсором
+        по событию это ещё и риск пропуска. У «СписокЗадач» такого поля нет,
+        у «СписокИзмененийПриглашений» другое (ИдентификаторАЯ), поэтому
+        оба помечены False и наш объект туда не подставляется.
     verified: True, если params_root и result_key подтверждены живым вызовом.
     """
 
@@ -81,6 +87,7 @@ class Command:
     paginated: bool = False
     pagination_mode: str = "none"
     page_size_max: int = 200
+    accepts_our_company: bool = False
     verified: bool = False
     doc: str = ""
 
@@ -128,7 +135,8 @@ DOCUMENTS: tuple[Command, ...] = (
         required_params=("Фильтр.Тип",),
         result_key="Документ",
         paginated=True,
-        pagination_mode="page",   # 16.10.2026: Страница 0/1 отдают разные строки
+        pagination_mode="page",
+        accepts_our_company=True,   # 16.10.2026: Страница 0/1 отдают разные строки
         verified=True,
         doc=f"{DOCS}/all_methods/list_doc",
     ),
@@ -151,7 +159,7 @@ DOCUMENTS: tuple[Command, ...] = (
         # 16.10.2026, реестр за месяц при РазмерСтраницы=25: страницы 0, 1 и 2
         # отдали первые события от 16.10, 13.10 и 09.10 — смещение работает.
         pagination_mode="page",
-        verified=True,
+        accepts_our_company=True,   verified=True,
         doc=f"{DOCS}/all_methods/events_doc",
     ),
     Command(
@@ -194,6 +202,7 @@ DOCUMENTS: tuple[Command, ...] = (
         # «СледующаяПозиция.ДатаВремя». Потолок страницы здесь 50, а не 200.
         # Проверено 16.10.2026: «Позиция.ДатаВремя» сервер принимает.
         pagination_mode="position",
+        accepts_our_company=False,
         page_size_max=50,
         verified=True,
         doc=f"{DOCS}/all_methods/task_list",
@@ -221,7 +230,15 @@ DOCUMENTS: tuple[Command, ...] = (
         # события не вернулся, пропусков на стыке не вылезло.
         # НЕ путать с остальными командами: там Страница работает.
         pagination_mode="event_cursor",
-        page_size_max=50,   # справка: для этого упрощённого варианта 0..50
+        accepts_our_company=True,
+        # Справка для этого упрощённого варианта даёт «РазмерСтраницы» 0..50.
+        # Резать до 50 формально верно, но на живых данных Saby принимает и
+        # 200 и отдаёт выборку целиком (сверено: те же 260 событий — за два
+        # вызова при 200 и за одиннадцать при 25). За сутки 16.10 было
+        # 860 событий: при порции 50 это 18 вызовов только на изменения,
+        # и бюджета сводки в 48 могло бы не хватить. Поэтому 200, а
+        # расхождение со справкой записано здесь, чтобы не потерялось.
+        page_size_max=200,
         verified=True,
         doc=f"{DOCS}/all_methods/changeslist",
     ),
@@ -246,6 +263,7 @@ DOCUMENTS: tuple[Command, ...] = (
         # смещение на живых строках не удалось: необработанных этапов на момент
         # проверки не было. Потолок страницы по справке — 20, не 200.
         pagination_mode="page",
+        accepts_our_company=True,
         page_size_max=20,
         verified=True,
         doc=f"{DOCS}/all_methods/stage_doc",
@@ -440,6 +458,7 @@ COUNTERAGENTS: tuple[Command, ...] = (
         # команда помечена «none» и отдаёт одну страницу. Потолок 200, при
         # 45 записях за год это обычно вся выдача целиком.
         pagination_mode="none",
+        accepts_our_company=False,
         page_size_max=200,
         verified=True,
         doc=f"{DOCS}/all_methods/list_invitation_changes",
@@ -463,7 +482,7 @@ ORGANIZATIONS: tuple[Command, ...] = (
         # 16.10.2026: страница 0 отдала 2 строки с «Страница» = «0»,
         # страница 1 — 0 строк с «Страница» = «1». Смещение работает.
         pagination_mode="page",
-        verified=True,
+        accepts_our_company=False,   verified=True,
         doc=f"{DOCS}/all_methods/company",
     ),
     Command(

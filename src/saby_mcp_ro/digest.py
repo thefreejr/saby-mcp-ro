@@ -87,15 +87,19 @@ PAGE_SIZE = "200"
 # Одностраничный фильтр для списочных команд. Указывать нужно ВНУТРИ `Фильтр`:
 # в корне параметров объект игнорируется и ответ приходит пустым.
 def page_filter(extra: dict[str, Any] | None = None,
-                accepts_org: bool = True) -> dict[str, Any]:
+                accepts_org: bool = True,
+                page_size: str | None = None) -> dict[str, Any]:
     """Фильтр списочной команды: страница плюс отбор по организации.
 
     Отбор берётся из `config.json` — без него Saby отдаёт смесь по всем
     организациям кабинета, а у нас их две. Организацию, заданную в `extra`,
     не перебиваем.
+
+    `page_size` нужен там, где потолок команды меньше общего: у задач это 50,
+    у служебных этапов 20, и просить больше бессмысленно.
     """
     merged: dict[str, Any] = dict(extra or {})
-    merged["Навигация"] = {"РазмерСтраницы": PAGE_SIZE}
+    merged["Навигация"] = {"РазмерСтраницы": page_size or PAGE_SIZE}
     return config.scoped_filter({"Фильтр": merged}, accepts_org)
 
 
@@ -107,6 +111,10 @@ MIN_SLICE_MINUTES = 15
 # Сколько состояний пробуем при переполненном дне: имена берём из первой
 # порции, а перебор всех состояний Saby здесь недоступен и не нужен.
 MAX_SPLITS = 6
+# Потолок страницы у «СписокЗадач» по справке — 50, а не общие 200. Просить
+# больше бессмысленно, но если вдруг Saby срежет молча, сводка об этом скажет
+# в notes: она проверяет «ЕстьЕще» после каждого списка задач.
+TASKS_PAGE_MAX = 50
 
 # Что считаем «требует внимания».
 #
@@ -482,7 +490,11 @@ async def pending(
         if not budget.take():
             notes.append(f"Список «{name}» пропущен: исчерпан лимит вызовов.")
             continue
-        result = await client.call_command("spisok_zadach", {"Фильтр": page_filter({"ТипСписка": name})})
+        result = await client.call_command(
+            "spisok_zadach",
+            {"Фильтр": page_filter({"ТипСписка": name},
+                                   accepts_org=False,
+                                   page_size=str(TASKS_PAGE_MAX))})
         rows = pagination.extract_rows(result, "Документ")
         if pagination.has_more(result):
             notes.append(

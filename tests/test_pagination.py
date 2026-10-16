@@ -26,29 +26,37 @@ def _bodies(recorder):
 
 # --- regression: Навигация в запросе ----------------------------------------
 
-async def test_regression_never_sends_navigation_object(recorder, client):
-    """Saby не принимает объект Навигация в запросе.
+async def test_regression_navigation_never_goes_to_the_root(recorder, client):
+    """Навигация должна быть ВНУТРИ корневого объекта, а не рядом с ним.
 
-    Проверено живьём: и с РазмерСтраницы, и с Позиция.ДатаВремя, и даже пустой
-    `{}` — ответ -32601 «метод не найден». Ключевое слово здесь «метод»:
-    команда существует и называется верно, не разобрались именно params.
+    Именно из-за этой ошибки «Навигация не работает» и родился: в корне
+    параметров Saby её молча игнорирует и отвечает пустым реестром, что
+    выглядит как поломка сервера. Внутри «Фильтра» всё работает.
     """
     recorder.result(_page(_rows(10), Навигация={"ЕстьЕще": "Нет"}))
     await pagination.fetch_all(client, "spisok_dokumentov",
                                {"Фильтр": {"Тип": "x"}})
     assert "Навигация" not in recorder.last["json"]["params"]
+    assert recorder.last["json"]["params"]["Фильтр"]["Навигация"]
 
 
 @pytest.mark.parametrize("command_id", [
     "spisok_dokumentov", "spisok_zadach", "spisok_izmeneniy",
     "spisok_sluzhebnyh_etapov", "spisok_nashih_organizaciy",
 ])
-async def test_no_navigation_for_any_paginated_command(recorder, client, command_id):
-    recorder.result(_page(_rows(5)))
+async def test_every_paginated_command_gets_a_page_size(recorder, client, command_id):
+    """Все команды с корневым объектом получают размер страницы — внутри него.
+
+    Имя теста раньше было обратным («навигации нет ни у кого») и держало
+    неверное утверждение. Размер страницы работает у всех; различается
+    только способ листать, см. `pagination_mode`.
+    """
+    recorder.result(_page(_rows(5), Навигация={"ЕстьЕще": "Нет"}))
     cmd = catalog.get(command_id)
-    await pagination.fetch_all(client, command_id, {})
-    assert "Навигация" not in recorder.last["json"]["params"], command_id
     assert cmd is not None
+    await pagination.fetch_all(client, command_id, {})
+    nav = recorder.last["json"]["params"][cmd.params_root]["Навигация"]
+    assert nav["РазмерСтраницы"] == pagination.PAGE_SIZE, command_id
 
 
 # --- подстановка корневого объекта ------------------------------------------
@@ -72,7 +80,7 @@ async def test_root_object_not_overwritten(recorder, client):
                                {"Фильтр": {"Тип": "Счет"}})
     sent = _bodies(recorder)[0]["Фильтр"]
     assert sent["Тип"] == "Счет"
-    assert sent["Навигация"] == {"РазмерСтраницы": pagination.PAGE_SIZE}
+    assert sent["Навигация"]["РазмерСтраницы"] == pagination.PAGE_SIZE
 
 
 async def test_page_size_is_capped_at_saby_limit(recorder, client):
@@ -80,7 +88,7 @@ async def test_page_size_is_capped_at_saby_limit(recorder, client):
     recorder.result(_page(_rows(5)))
     await pagination.fetch_all(client, "spisok_dokumentov", {}, page_size=5000)
     sent = _bodies(recorder)[0]["Фильтр"]["Навигация"]
-    assert sent == {"РазмерСтраницы": "200"}
+    assert sent["РазмерСтраницы"] == "200"
 
 
 async def test_command_without_root_stays_empty(recorder, client):
@@ -88,6 +96,183 @@ async def test_command_without_root_stays_empty(recorder, client):
     recorder.result({"Список": [{"НазваниеАккаунта": "ООО Ромашка"}]})
     await pagination.fetch_all(client, "spisok_akkauntov")
     assert _bodies(recorder)[0] == {}
+
+
+# --- обход страниц ----------------------------------------------------------
+
+def _paged(recorder, pages):
+    """Заложить ответы по одному на вызов — в том порядке, в каком придут."""
+    for payload in pages:
+        recorder.result(payload)
+
+
+async def test_pages_are_walked_with_page_number(recorder, client):
+    """`page`: страницы идут 0, 1, 2 … пока сервер говорит «ЕстьЕще = Да»."""
+    _paged(recorder, [
+        _page(_rows(3, 0), Навигация={"ЕстьЕще": "Да", "Страница": "0"}),
+        _page(_rows(3, 3), Навигация={"ЕстьЕще": "Да", "Страница": "1"}),
+        _page(_rows(2, 6), Навигация={"ЕстьЕще": "Нет", "Страница": "2"}),
+    ])
+    out = await pagination.fetch_all(client, "spisok_dokumentov_po_sobytiyam",
+                                     {"Фильтр": {"ТипРеестра": "Входящие"}})
+
+    assert out["total_fetched"] == 8
+    assert out["pages_fetched"] == 3
+    assert out["truncated"] is False
+    assert "notes" not in out
+
+    sent = [p["Фильтр"]["Навигация"]["Страница"] for p in _bodies(recorder)]
+    assert sent == ["0", "1", "2"]
+
+
+async def test_page_size_survives_the_cursor_merge(recorder, client):
+    """Курсор не должен стирать запрошенный размер страницы."""
+    _paged(recorder, [
+        _page(_rows(2, 0), Навигация={"ЕстьЕще": "Да", "Страница": "0"}),
+        _page(_rows(1, 2), Навигация={"ЕстьЕще": "Нет", "Страница": "1"}),
+    ])
+    await pagination.fetch_all(client, "spisok_dokumentov",
+                               {"Фильтр": {"Тип": "СчетИсх"}}, page_size=50)
+    for body in _bodies(recorder):
+        nav = body["Фильтр"]["Навигация"]
+        assert nav["РазмерСтраницы"] == "50"
+    assert _bodies(recorder)[0]["Фильтр"]["Тип"] == "СчетИсх"
+
+
+def _change_rows(count, start, when="15.10.2026 10.00.00"):
+    """Документы с событиями — для курсора по событию."""
+    return [{
+        "Идентификатор": f"doc-{start + i}",
+        "Событие": [{"Идентификатор": f"evt-{start + i}",
+                     "ДатаВремя": f"{when}#{start + i}"}],
+    } for i in range(count)]
+
+
+async def test_event_cursor_advances_by_event_id(recorder, client):
+    """`event_cursor`: в следующий запрос идёт Событие.Идентификатор, не документ."""
+    _paged(recorder, [
+        _page(_change_rows(2, 0), Навигация={"ЕстьЕще": "Да"}),
+        _page(_change_rows(2, 2), Навигация={"ЕстьЕще": "Нет"}),
+    ])
+    out = await pagination.fetch_all(client, "spisok_izmeneniy",
+                                     {"Фильтр": {"ДатаВремяС": "15.10.2026 10.00.00"}})
+
+    assert out["total_fetched"] == 4
+    assert out["pages_fetched"] == 2
+    assert out["truncated"] is False
+
+    second = _bodies(recorder)[1]["Фильтр"]
+    assert second["ИдентификаторСобытия"].startswith("evt-")
+    assert "ДатаВремяС" in second
+    # документ в курсор попасть не должен — Saby на такой идентификатор
+    # отвечает иначе, и на этом когда-то и вырос ложный вывод
+    assert second["ИдентификаторСобытия"] not in ("doc-0", "doc-1")
+
+
+async def test_event_cursor_picks_latest_event_not_last_in_list(recorder, client):
+    """Порядок событий в выдаче не гарантирован — берём самый свежий."""
+    _paged(recorder, [
+        _page([{"Идентификатор": "d1", "Событие": [
+            {"Идентификатор": "evt-new", "ДатаВремя": "15.10.2026 12.00.00"},
+            {"Идентификатор": "evt-old", "ДатаВремя": "15.10.2026 09.00.00"},
+        ]}], Навигация={"ЕстьЕще": "Да"}),
+        _page(_rows(0), Навигация={"ЕстьЕще": "Нет"}),
+    ])
+    await pagination.fetch_all(client, "spisok_izmeneniy",
+                               {"Фильтр": {"ДатаВремяС": "15.10.2026 00.00.00"}})
+    second = _bodies(recorder)[1]["Фильтр"]
+    assert second["ИдентификаторСобытия"] == "evt-new"
+    assert second["ДатаВремяС"] == "15.10.2026 12.00.00"
+
+
+async def test_identical_rows_are_not_counted_twice(recorder, client):
+    """Сервер может вернуть одни и те же строки — они не должны задваиваться."""
+    same = _rows(4, 0)
+    _paged(recorder, [
+        _page(same, Навигация={"ЕстьЕще": "Да", "Страница": "0"}),
+        _page(same, Навигация={"ЕстьЕще": "Нет", "Страница": "1"}),
+    ])
+    out = await pagination.fetch_all(client, "spisok_dokumentov",
+                                     {"Фильтр": {"Тип": "x"}})
+    assert out["total_fetched"] == 4
+
+
+async def test_same_document_with_new_event_is_not_dropped(recorder, client):
+    """Тот же документ с ДРУГИМ событием — это новая строка, а не дубль.
+
+    Регрессия с живых данных 16.10.2026: дедупликация по одному
+    `Идентификатор` документа выкидывала события, и за двое суток приходило
+    74 строки вместо 200+.
+    """
+    _paged(recorder, [
+        _page(_change_rows(1, 0), Навигация={"ЕстьЕще": "Да"}),
+        _page([{"Идентификатор": "doc-0",
+                "Событие": [{"Идентификатор": "evt-9",
+                             "ДатаВремя": "15.10.2026 11.00.00"}]}],
+              Навигация={"ЕстьЕще": "Нет"}),
+    ])
+    out = await pagination.fetch_all(client, "spisok_izmeneniy",
+                                     {"Фильтр": {"ДатаВремяС": "15.10.2026 10.00.00"}})
+    assert out["total_fetched"] == 2
+
+
+async def test_unchanging_cursor_stops_the_walk(recorder, client):
+    """Сервер, вечно отвечающий «Да» одной и той же страницей, не зациклит обход."""
+    stuck = _page(_rows(3, 0), Навигация={"ЕстьЕще": "Да", "Страница": "0"})
+    _paged(recorder, [stuck, stuck, stuck, stuck])
+    out = await pagination.fetch_all(client, "spisok_dokumentov",
+                                     {"Фильтр": {"Тип": "x"}})
+    assert out["pages_fetched"] < pagination.MAX_PAGES
+    assert out["truncated"] is True
+    assert out["notes"]
+
+
+async def test_command_without_pagination_says_it_is_a_single_page(recorder, client):
+    """У `СписокЗадач` поля Страница нет — обход обрывается и говорит об этом."""
+    _paged(recorder, [
+        _page(_rows(25, 0), Навигация={"ЕстьЕще": "Да", "РазмерСтраницы": "25"}),
+    ])
+    out = await pagination.fetch_all(client, "spisok_zadach",
+                                     {"Фильтр": {"ТипСписка": "НаМне"}})
+    assert out["pages_fetched"] == 1
+    assert out["total_fetched"] == 25
+    assert out["truncated"] is True
+    assert "Страница" in out["notes"][0]
+
+
+async def test_max_items_cuts_and_says_so(recorder, client):
+    _paged(recorder, [
+        _page(_rows(10, 0), Навигация={"ЕстьЕще": "Да", "Страница": "0"}),
+    ])
+    out = await pagination.fetch_all(client, "spisok_dokumentov",
+                                     {"Фильтр": {"Тип": "x"}}, max_items=4)
+    assert out["total_fetched"] == 4
+    assert out["truncated"] is True
+    assert any("лимита" in n for n in out["notes"])
+
+
+async def test_has_more_without_rows_does_not_spin(recorder, client):
+    """«ЕстьЕще = Да» при нуле строк — продолжать нечем, и крутиться не надо."""
+    _paged(recorder, [
+        _page(_rows(0), Навигация={"ЕстьЕще": "Да", "Страница": "0"}),
+    ])
+    out = await pagination.fetch_all(client, "spisok_dokumentov",
+                                     {"Фильтр": {"Тип": "x"}})
+    assert out["pages_fetched"] == 1
+    assert out["truncated"] is False
+
+
+async def test_walk_is_bounded_by_max_pages(recorder, client):
+    """Даже с исправно работающим курсором обход обязан быть конечным."""
+    _paged(recorder, [
+        _page(_rows(2, i * 2), Навигация={"ЕстьЕще": "Да", "Страница": str(i)})
+        for i in range(pagination.MAX_PAGES + 5)
+    ])
+    out = await pagination.fetch_all(client, "spisok_dokumentov",
+                                     {"Фильтр": {"Тип": "x"}})
+    assert out["pages_fetched"] == pagination.MAX_PAGES
+    assert out["truncated"] is True
+    assert any("страницах" in n for n in out["notes"])
 
 
 # --- честность при усечении -------------------------------------------------

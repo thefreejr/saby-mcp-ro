@@ -44,8 +44,12 @@ def _error(exc: Exception) -> str:
 
 
 PAGINATION_LABELS = {
-    "page": "сервер отдаёт порциями, см. notes",
-    "none": "нет, одна страница",
+    "page": ("листается «Навигация.Страница» (номер страницы с нуля); размер "
+             "страницы до 200 через «Навигация.РазмерСтраницы»"),
+    "event_cursor": ("упрощённый вариант «Навигации», поля «Страница» нет; "
+                     "листает «Фильтр.ИдентификаторСобытия» + «ДатаВремяС»"),
+    "none": ("«ЕстьЕще» возможен, но способа листать нет: saby_fetch_all "
+             "отдаст одну страницу и пометит результат truncated"),
 }
 
 
@@ -60,6 +64,8 @@ def _card(cmd: catalog.Command) -> dict[str, Any]:
         "needs_session": cmd.needs_session,
         "params_root": cmd.params_root or "не требуется",
         "paginated": cmd.paginated,
+        "pagination_mode": PAGINATION_LABELS.get(cmd.pagination_mode,
+                                              cmd.pagination_mode),
         "params": cmd.params_shape or "у команды нет параметров",
         "required": list(cmd.required_params) or "нет обязательных",
         "result_key": cmd.result_key or "result сам является массивом",
@@ -189,10 +195,14 @@ def register(mcp, client: SabyClient, store: CredentialStore) -> None:
 
         Ограничение прежнее было ложным: «Навигация.РазмерСтраницы» внутри
         корневого объекта фильтра работает и поднимает порцию с 25 строк до
-        потолка Saby (200) — проверено на боевой сессии 15.10.2026. Дальше
-        первой страницы обход пока не идёт (в pagination._advance ждёт
-        реализации курсор), и если сервер всё же сказал «ЕстьЕще = Да»,
-        инструмент честно пишет об усечении в notes.
+        потолка Saby (200) — проверено на боевой сессии 15.10.2026.
+
+        Страницы обходятся самостоятельно, способ зависит от команды:
+        у большинства списочных это «Навигация.Страница», а у
+        «СБИС.СписокИзменений» — упрощённый вариант «Навигации» без поля
+        «Страница», там работает курсор по «Фильтр.ИдентификаторСобытия».
+        У «СписокЗадач» и «СписокИзмененийПриглашений» способа листать нет:
+        они отдают одну страницу, и об этом честно пишется в notes.
 
         Args:
             command_id: id команды из saby_search.
@@ -200,8 +210,9 @@ def register(mcp, client: SabyClient, store: CredentialStore) -> None:
             page_size: размер страницы, по умолчанию максимум Saby (200).
                 Значения больше 200 всё равно срезаются до 200.
             max_items: предохранитель, столько строк максимум (по умолчанию 5000).
-        Returns JSON: {"ok", "items", "total_fetched", "truncated",
-            "server_navigation"}. Если выдача усечена, причина в "notes".
+        Returns JSON: {"ok", "items", "total_fetched", "pages_fetched",
+            "truncated", "server_navigation"}. Если выдача усечена, причина в
+            "notes" — не молча, а текстом.
         """
         try:
             max_items = max(1, max_items)

@@ -127,18 +127,51 @@ def scoped_filter(extra: dict | None = None, accepts: bool = True) -> dict:
     return {**merged, "НашаОрганизация": org}
 
 
-def scope_filter(params: dict, command_accepts: bool) -> dict:
-    """Подставить отбор по организации в корень параметров, если его нет.
+def _place(params: dict, path: tuple[str, ...], extra: dict) -> dict:
+    """Вложить `extra` по пути `path`, создав недостающие уровни.
+
+    У большинства команд путь один — корневой объект. У «СписокПодразделений»
+    их два: `Параметр` → `Фильтр`, и «Навигация» с «НашаОрганизацией» лежат
+    именно во внутреннем (справка list_squad, живая проверка 17.10.2026).
+    """
+    out = dict(params)
+    cur = out
+    for key in path:
+        nxt = cur.get(key)
+        cur[key] = dict(nxt) if isinstance(nxt, dict) else {}
+        cur = cur[key]
+    cur.update(extra)
+    return out
+
+
+def scope_filter(params: dict, command_accepts: bool,
+                 path: tuple[str, ...] = ()) -> dict:
+    """Подставить отбор по организации туда, где команда его принимает.
 
     Ничего не подменяет: если вызывающий уже передал `НашаОрганизация` —
     значит, он знает, чего хочет. Параметры не мутируются на месте.
 
-    `command_accepts` — умеет ли команда такой отбор вообще; у
-    «СписокЗадач» его нет, а у «СписокИзмененийПриглашений» другое поле
-    (ИдентификаторАЯ), туда наш объект не подставляется.
+    `path` — по справке на конкретную команду; пустой означает «перебрать
+    корневые объекты самим» для обратной совместимости.
     """
     if not command_accepts:
         return params
+    if path:
+        cur = params
+        for key in path:
+            cur = cur.get(key) if isinstance(cur, dict) else None
+            if not isinstance(cur, dict):
+                cur = None
+                break
+        if isinstance(cur, dict) and cur.get("НашаОрганизация"):
+            return params
+        org = Settings().our_company()
+        if not org:
+            return params
+        # Уровни создаются, а не требуются готовыми: у «СписокПодразделений»
+        # без «НашаОрганизации» команда не отвечает вовсе, и пустой запрос
+        # читался бы как «подразделений нет».
+        return _place(params, path, {"НашаОрганизация": org})
     for root in ("Фильтр", "Параметр", "Отбор"):
         inner = params.get(root)
         if isinstance(inner, dict) and inner.get("НашаОрганизация"):
@@ -147,7 +180,6 @@ def scope_filter(params: dict, command_accepts: bool) -> dict:
     if not org:
         return params
     for root in ("Фильтр", "Параметр", "Отбор"):
-        inner = params.get(root)
-        if isinstance(inner, dict):
-            return {**params, root: {**inner, "НашаОрганизация": org}}
+        if isinstance(params.get(root), dict):
+            return _place(params, (root,), {"НашаОрганизация": org})
     return params

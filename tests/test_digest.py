@@ -264,14 +264,16 @@ async def test_incoming_always_asks_for_a_big_page():
 
 async def test_changes_ask_for_a_big_page_too():
     """`СписокИзменений` — главный потребитель страницы: без неё он режет
-    окно до 15 минут рекурсией и теряет события на стыках."""
+    окно до 15 минут рекурсией и теряет события на стыках.
+
+    Порция — 50, потолок из справки changeslist, а не общие 200."""
     client = _Fake(spisok_izmeneniy={"Документ": [_change()], "Навигация": _nav()})
     await digest.changes(client, datetime(2026, 10, 12, 0, 0, 0),
                          datetime(2026, 10, 12, 23, 59, 59), digest._Budget(), [])
     sent = client.params_of("spisok_izmeneniy")
     assert len(sent) == 1, f"окно не влезло в одну страницу: {len(sent)} вызовов"
     assert (sent[0]["Фильтр"]["Навигация"]
-            == {"РазмерСтраницы": digest.PAGE_SIZE})
+            == {"РазмерСтраницы": "50"})
 
 
 async def test_regression_overflow_day_is_split_by_state_and_says_so():

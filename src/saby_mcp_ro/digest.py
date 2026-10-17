@@ -88,18 +88,22 @@ PAGE_SIZE = "200"
 # в корне параметров объект игнорируется и ответ приходит пустым.
 def page_filter(extra: dict[str, Any] | None = None,
                 accepts_org: bool = True,
-                page_size: str | None = None) -> dict[str, Any]:
+                page_size: str | None = None,
+                ceiling: int | None = None) -> dict[str, Any]:
     """Фильтр списочной команды: страница плюс отбор по организации.
+
+    `page_size` и `ceiling` задают размер страницы. Потолок по умолчанию
+    берётся из справки на конкретную команду: у `СписокИзменений` это 50, а
+    не общие 200, и просить больше бессмысленно — Saby всё равно срежет, а
+    сколько на самом деле пришло, мы бы не узнали.
 
     Отбор берётся из `config.json` — без него Saby отдаёт смесь по всем
     организациям кабинета, а у нас их две. Организацию, заданную в `extra`,
     не перебиваем.
-
-    `page_size` нужен там, где потолок команды меньше общего: у задач это 50,
-    у служебных этапов 20, и просить больше бессмысленно.
     """
     merged: dict[str, Any] = dict(extra or {})
-    merged["Навигация"] = {"РазмерСтраницы": page_size or PAGE_SIZE}
+    size = page_size or str(min(PAGE_SIZE, ceiling or PAGE_SIZE))
+    merged["Навигация"] = {"РазмерСтраницы": size}
     return config.scoped_filter({"Фильтр": merged}, accepts_org)
 
 
@@ -572,10 +576,12 @@ async def _changes_range(
         )
         return [], False
 
+    # Размер страницы не задаём: `fetch_all` сам берёт потолок из справки на
+    # эту команду. У «СписокИзменений» это 50, а общие 200 она не примет.
     result = await pagination.fetch_all(
         client, "spisok_izmeneniy",
         {"Фильтр": {"ДатаВремяС": fmt_dt(start), "ДатаВремяПо": fmt_dt(end)}},
-        page_size=PAGE_SIZE, max_items=MAX_EVENTS,
+        max_items=MAX_EVENTS,
         max_pages=budget.remaining,
     )
     budget.take(result["pages_fetched"])
@@ -587,70 +593,6 @@ async def _changes_range(
             "намеренно не сдвинут — в следующий раз они попадут в сводку снова."
         )
     return result["items"], complete
-    """Строки `СписокИзменений` за окно; делением окна пополам — только как фолбэк.
-
-    Эта команда без явной страницы отдаёт 25 строк и `ЕстьЕще = Да`. Раньше
-    отсюда делали вывод, что обойти порцию нельзя, и резали окно пополам до
-    15 минут рекурсией — это и порождало ~20 вызовов на сутки и неполные
-    интервалы в сводке.
-
-    ИСПРАВЛЕНИЕ 15.10.2026: `Навигация.РазмерСтраницы = «200»` внутри `Фильтр`
-    отдаёт всю выборку за один вызов. Замерено на боевых данных:
-
-        без навигации        → 25 строк, ЕстьЕще = «Да»
-        РазмерСтраницы=«50» → 50 строк, ЕстьЕще = «Да»
-        РазмерСтраницы=«200»→ 98 строк, ЕстьЕще = «Нет»   (окно 10:00–11:00)
-        сутки 15.10          → 175 событий, ЕстьЕще = «Нет», 1 вызов
-
-    Деление окна оставлено на случай `ЕстьЕще = «Да»` даже при 200 строках —
-    такой случай на живых данных не встретился, но код обязан выжить и на
-    нём, а не молча отдать неполное.
-    """
-    minutes = max(1, int((end - start).total_seconds() // 60))
-    collected: list[Any] = []
-
-    async def walk(first: int, last: int) -> bool:
-        frm = start + timedelta(minutes=first)
-        # Полуинтервал: правую границу отдаём на секунду раньше, иначе событие
-        # ровно на стыке двух окон попадёт в оба и дважды попадёт в сводку.
-        # Последнее окно — это всё окно, и его правая граница точная.
-        to = end if last >= minutes else start + timedelta(minutes=last) - timedelta(
-            seconds=1)
-        if not budget.take():
-            raise _BudgetSpent()
-        result = await client.call_command("spisok_izmeneniy", {"Фильтр": page_filter({
-            "ДатаВремяС": fmt_dt(frm),
-            "ДатаВремяПо": fmt_dt(to),
-        })})
-        rows = pagination.extract_rows(result, "Документ")
-        complete = not pagination.has_more(result)
-        if complete:
-            collected.extend(rows)
-            return True
-        if last - first <= MIN_SLICE_MINUTES or to <= frm:
-            notes.append(
-                f"Изменения с {fmt_dt(frm)} по {fmt_dt(to)}: Saby отдала только "
-                f"{len(rows)} строк даже при странице в {PAGE_SIZE}, порция "
-                "кончилась. Эти данные показаны не полностью."
-            )
-            collected.extend(rows)
-            return False
-        middle = first + (last - first) // 2
-        left = await walk(first, middle)
-        right = await walk(middle, last)
-        return left and right
-
-    try:
-        complete = await walk(0, minutes)
-    except _BudgetSpent:
-        notes.append(
-            f"Изменения с {fmt_dt(start)}: окно перебрано не полностью — "
-            f"исчерпан лимит {budget.limit} вызовов на сводку."
-        )
-        complete = False
-
-    merged = {_row_key(row): row for row in collected}
-    return list(merged.values()), complete
 
 
 async def changes(

@@ -107,6 +107,8 @@
 """
 from __future__ import annotations
 
+import json
+
 from typing import Any
 
 from . import catalog
@@ -193,6 +195,15 @@ FILTER_ROOTS = ("Фильтр", "Параметр", "Отбор")
 # отвечать «ЕстьЕще = Да» и отдавать одну и ту же страницу. Суммарно через
 # fetch_all это ещё и способ разом вытянуть весь аккаунт, а не окно дат.
 MAX_PAGES = 60
+# Мягкий потолок на ВЕСИну ответа, а не на число строк. Проверено 17.10.2026:
+# окно в шесть суток дало 1963 строки и 17,9 МБ JSON — и MCP-сервер на этом
+# умер, молча унеся с собой соединение. Обход к этому моменту был полностью
+# прав и через CLI отрабатывал нормально; убивало именно то, что такой объём
+# положено отдать агенту в одном сообщении.
+#
+# 2 МБ — это около 450–500 строк: достаточно для любого разумного вопроса и
+# заведомо переживает транспорт. Кто хочет больше, пусть сузит период.
+OUTPUT_SOFT_LIMIT = 5_000_000
 
 
 def _with_page_size(params: dict[str, Any],
@@ -279,6 +290,7 @@ async def fetch_all(
     # Почему обход встал, если встал. Пока это None — выдача кончилась
     # честно, и объявлять усечение незачем.
     stop: str | None = None
+    payload_bytes = 0
 
     while pages < max_pages and len(collected) < max_items:
         result = await client.call_command(
@@ -287,6 +299,7 @@ async def fetch_all(
         rows = extract_rows(result, cmd.result_key)
         nav = server_navigation(result)
         pages += 1
+        payload_bytes += _weight(rows)
         collected.extend(r for r in rows if _not_seen(r, seen))
 
         if not has_more(result):
@@ -302,6 +315,10 @@ async def fetch_all(
             stop = "stuck"
             break
         stuck = step
+
+        if payload_bytes > OUTPUT_SOFT_LIMIT:
+            stop = "heavy"
+            break
     else:
         # Цикл дошёл до границы сам, а не вырвался.
         stop = "max_pages" if pages >= max_pages else "max_items"
@@ -314,6 +331,16 @@ async def fetch_all(
             notes.append(
                 f"Обход остановлен на {max_pages} страницах — выдача больше не "
                 "продвигается. Сузите период."
+            )
+        elif stop == "heavy":
+            notes.append(
+                f"Ответ разросся примерно до {payload_bytes / 1e6:.1f} МБ — "
+                f"это слишком много для одного вызова агента (потолок "
+                f"{OUTPUT_SOFT_LIMIT // 1000000} МБ). Сузите период. Для "
+                "вопроса «что изменилось» используйте saby_digest: он "
+                "проецирует документы до двадцати полей и отдаёт статистику, "
+                "а не сырые строки. Ничего не потеряно, не показана только "
+                "часть выдачи."
             )
         else:
             notes.append(
@@ -328,6 +355,18 @@ async def fetch_all(
             f"Возвращено больше лимита {max_items} строк, лишние отброшены."
         )
 
+    # Доводка по настоящему весу. Оценка выше по выборке пяти строк
+    # занижала результат примерно на четверть — строки разной величины, —
+    # а решать надо по тому, что действительно уйдёт агенту.
+    collected, trimmed = _trim_to_limit(collected)
+    if trimmed:
+        truncated = True
+        notes.append(
+            f"Ответ урезан до ~{OUTPUT_SOFT_LIMIT // 1000000} МБ: показаны "
+            f"первые {len(collected)} строк. Для сводки используйте "
+            "saby_digest — он отдаёт статистику, а не сырые документы."
+        )
+
     out: dict[str, Any] = {
         "ok": True,
         "command": cmd.command,
@@ -340,6 +379,48 @@ async def fetch_all(
     if notes:
         out["notes"] = notes
     return out
+
+
+def _trim_to_limit(rows: list[Any]) -> tuple[list[Any], bool]:
+    """Отрезать хвост, пока ответ не влезет в потолок по настоящему весу.
+
+    Считается точный JSON, а не выборка: решать надо по тому, что реально
+    уйдёт агенту. Одна сериализация страницы в несколько мегабайт занимает
+    десятки миллисекунд — против десятков секунд самого обхода.
+    """
+    if not rows:
+        return rows, False
+    size = len(json.dumps(rows, ensure_ascii=False, default=str).encode("utf-8"))
+    if size <= OUTPUT_SOFT_LIMIT:
+        return rows, False
+    # Отрезаем хвост делением пополам: точность не нужна, нужна граница.
+    keep = len(rows)
+    while keep > 1:
+        keep = max(1, keep // 2)
+        probe = rows[:keep]
+        size = len(json.dumps(probe, ensure_ascii=False,
+                              default=str).encode("utf-8"))
+        if size <= OUTPUT_SOFT_LIMIT:
+            return probe, True
+    return rows[:1], True
+
+
+def _weight(rows: list[Any]) -> int:
+    """Примерный вес страницы в байтах.
+
+    Считается по выборке из нескольких строк, помноженной на их число:
+    точная сериализация каждой страницы стоила бы дороже, чем сам обход.
+    Оценка нужна только чтобы поймать «миллионы строк» до того, как ответ
+    уйдёт агенту. Одна проба давала занижение вдвое — строки сильно разные
+    по весу, — поэтому берём до пяти, равномерно по странице.
+    """
+    if not rows:
+        return 0
+    step = max(1, len(rows) // 5)
+    sample = rows[::step][:5]
+    average = sum(len(json.dumps(r, ensure_ascii=False, default=str).encode("utf-8"))
+                  for r in sample) / len(sample)
+    return int(average * len(rows))
 
 
 def _merge(base: dict[str, Any], step: Any) -> dict[str, Any]:

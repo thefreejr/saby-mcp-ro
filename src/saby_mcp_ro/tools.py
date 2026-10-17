@@ -43,6 +43,49 @@ def _error(exc: Exception) -> str:
     return _j({"ok": False, "error": type(exc).__name__, "message": str(exc)})
 
 
+# Потолок на вес ОТВЕТА АГЕНТУ. Проверено 17.10.2026: saby_fetch_all за шесть
+# суток отдавал 1963 сырых документа — 17,9 МБ JSON — и MCP-сервер на этом
+# умер вместе с соединением. Обход при этом был полностью прав и через CLI
+# отрабатывал нормально: убивало именно то, что такой объём положено отдать
+# агенту в одном сообщении.
+#
+# Ограничение стоит здесь, а не в pagination.fetch_all, и это не украшение:
+# вызывающий fetch_all изнутри программы (сводка) проецирует строки до
+# двадцати полей, и усечение сырых данных било по нему на ровном месте —
+# 16.10 сводка вместо 1498 событий показывала 399. Резать надо то, что
+# действительно уходит в транспорт.
+OUTPUT_SOFT_LIMIT = 5_000_000
+
+
+def _weight(rows) -> int:
+    """Примерный вес списка в байтах: по выборке, а не полной сериализацией."""
+    if not rows:
+        return 0
+    step = max(1, len(rows) // 5)
+    sample = rows[::step][:5]
+    average = sum(len(json.dumps(r, ensure_ascii=False, default=str).encode("utf-8"))
+                  for r in sample) / len(sample)
+    return int(average * len(rows))
+
+
+def _trim_to_limit(rows):
+    """Отрезать хвост, пока ответ не влезет в потолок по настоящему весу."""
+    if not rows:
+        return rows, False
+    size = len(json.dumps(rows, ensure_ascii=False, default=str).encode("utf-8"))
+    if size <= OUTPUT_SOFT_LIMIT:
+        return rows, False
+    keep = len(rows)
+    while keep > 1:
+        keep = max(1, keep // 2)
+        probe = rows[:keep]
+        size = len(json.dumps(probe, ensure_ascii=False,
+                              default=str).encode("utf-8"))
+        if size <= OUTPUT_SOFT_LIMIT:
+            return probe, True
+    return rows[:1], True
+
+
 PAGINATION_LABELS = {
     "page": ("листается «Навигация.Страница» (номер страницы с нуля)"),
     "position": ("листается «Навигация.Позиция.ДатаВремя» из "
@@ -223,6 +266,18 @@ def register(mcp, client: SabyClient, store: CredentialStore) -> None:
             out = await pagination.fetch_all(
                 client, command_id, params or {}, max_items=max_items,
             )
+            # Режем здесь, у самого транспорта: дальше эти строки уходят
+            # агенту как есть.
+            out["items"], trimmed = _trim_to_limit(out.get("items") or [])
+            if trimmed:
+                out["truncated"] = True
+                out["notes"] = list(out.get("notes") or []) + [
+                    f"Ответ урезан примерно до {OUTPUT_SOFT_LIMIT // 1000000} МБ: "
+                    f"показаны первые {len(out['items'])} строк из "
+                    f"{out.get('total_fetched', 0)}. Для сводки используйте "
+                    "saby_digest — он отдаёт статистику, а не сырые документы.",
+                ]
+                out["total_fetched"] = len(out["items"])
             return _j(out)
         except SabyError as exc:
             return _error(exc)
